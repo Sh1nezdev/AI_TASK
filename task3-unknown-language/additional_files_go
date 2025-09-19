@@ -1,0 +1,128 @@
+// go.mod - модуль Go
+module todo-api-go
+
+go 1.21
+
+require (
+	github.com/google/uuid v1.4.0
+	github.com/gorilla/mux v1.8.1
+	github.com/mattn/go-sqlite3 v1.14.18
+)
+
+---
+
+// README.md для Go проекта
+# Todo API на Go
+
+HTTP сервер для управления задачами, написанный на Go с использованием SQLite.
+
+## Возможности
+
+- 4 основных endpoint'а для CRUD операций
+- Фильтрация по статусу и приоритету
+- Поиск по названию и описанию
+- Валидация входных данных
+- SQLite база данных
+- CORS поддержка
+- Логирование запросов
+
+## Быстрый старт
+
+### Установка зависимостей
+
+```bash
+go mod tidy
+```
+
+### Запуск сервера
+
+```bash
+go run main.go
+```
+
+Сервер будет доступен по адресу: http://localhost:8080
+
+### Endpoints
+
+- `GET /api/todos` - получение всех задач
+- `POST /api/todos` - создание задачи
+- `GET /api/todos/{id}` - получение задачи по ID
+- `PUT /api/todos/{id}` - обновление задачи
+- `DELETE /api/todos/{id}` - удаление задачи
+- `GET /api/stats` - статистика
+- `GET /health` - проверка здоровья
+
+### Примеры запросов
+
+```bash
+# Создание задачи
+curl -X POST http://localhost:8080/api/todos \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Изучить Go", "description": "Освоить основы языка", "priority": "high"}'
+
+# Получение всех задач
+curl http://localhost:8080/api/todos
+
+# Фильтрация по статусу
+curl "http://localhost:8080/api/todos?status=pending"
+
+# Поиск
+curl "http://localhost:8080/api/todos?search=Go"
+```
+
+---
+
+// Makefile для Go проекта
+.PHONY: build run test clean deps
+
+# Сборка приложения
+build:
+	go build -o bin/todo-api main.go
+
+# Запуск в режиме разработки
+run:
+	go run main.go
+
+# Запуск тестов
+test:
+	go test -v ./...
+
+# Очистка артефактов сборки
+clean:
+	rm -rf bin/
+	rm -f todos.db
+
+# Установка зависимостей
+deps:
+	go mod download
+	go mod tidy
+
+# Форматирование кода
+fmt:
+	go fmt ./...
+
+# Проверка кода
+vet:
+	go vet ./...
+
+# Сборка для разных платформ
+build-all:
+	GOOS=linux GOARCH=amd64 go build -o bin/todo-api-linux-amd64 main.go
+	GOOS=windows GOARCH=amd64 go build -o bin/todo-api-windows-amd64.exe main.go
+	GOOS=darwin GOARCH=amd64 go build -o bin/todo-api-darwin-amd64 main.go
+
+# Запуск с логированием в файл
+run-log:
+	go run main.go 2>&1 | tee server.log
+
+---
+
+// Dockerfile для Go приложения
+FROM golang:1.21-alpine AS builder
+
+# Установка git для go mod
+RUN apk add --no-cache git
+
+WORKDIR /app
+
+#
