@@ -1,0 +1,520 @@
+# test_todo_api.py - Comprehensive Test Suite
+import pytest
+import asyncio
+import time
+from fastapi.testclient import TestClient
+from datetime import datetime, timezone, timedelta
+import json
+import uuid
+from unittest.mock import patch, MagicMock
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+
+# Import the app
+from main import app, todos, find_todo_by_id, create_todo_dict, TodoCreate
+
+# Test client
+client = TestClient(app)
+
+class TestSetup:
+    """Test setup and utilities"""
+    
+    @pytest.fixture(autouse=True)
+    def setup_and_teardown(self):
+        """Clear todos before each test"""
+        todos.clear()
+        yield
+        todos.clear()
+    
+    @staticmethod
+    def create_sample_todo(title="Test Todo", description="Test Description", priority="medium"):
+        """Helper to create a sample todo"""
+        return {
+            "title": title,
+            "description": description,
+            "priority": priority
+        }
+    
+    @staticmethod
+    def add_todo_to_storage(todo_data):
+        """Helper to add todo directly to storage"""
+        todo_create = TodoCreate(**todo_data)
+        todo_dict = create_todo_dict(todo_create)
+        todos.append(todo_dict)
+        return todo_dict
+
+class TestBasicFunctionality(TestSetup):
+    """Test basic CRUD operations"""
+    
+    def test_root_endpoint(self):
+        """Test root endpoint returns welcome message"""
+        response = client.get("/")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert "Todo API is running!" in data["message"]
+    
+    def test_health_check(self):
+        """Test health check endpoint"""
+        response = client.get("/health")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "healthy"
+        assert "timestamp" in data
+        assert "version" in data
+    
+    def test_get_empty_todos(self):
+        """Test getting todos when list is empty"""
+        response = client.get("/api/todos")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["data"] == []
+        assert data["count"] == 0
+    
+    def test_create_todo_success(self):
+        """Test creating a todo successfully"""
+        todo_data = self.create_sample_todo()
+        response = client.post("/api/todos", json=todo_data)
+        
+        assert response.status_code == 201
+        data = response.json()
+        assert data["success"] is True
+        assert data["data"]["title"] == todo_data["title"]
+        assert data["data"]["description"] == todo_data["description"]
+        assert data["data"]["priority"] == todo_data["priority"]
+        assert data["data"]["status"] == "pending"
+        assert "id" in data["data"]
+        assert "created_at" in data["data"]
+        assert "updated_at" in data["data"]
+    
+    def test_get_todo_by_id_success(self):
+        """Test getting a specific todo by ID"""
+        todo = self.add_todo_to_storage(self.create_sample_todo())
+        
+        response = client.get(f"/api/todos/{todo['id']}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["data"]["id"] == todo["id"]
+        assert data["data"]["title"] == todo["title"]
+    
+    def test_get_todo_by_id_not_found(self):
+        """Test getting a non-existent todo"""
+        fake_id = str(uuid.uuid4())
+        response = client.get(f"/api/todos/{fake_id}")
+        assert response.status_code == 404
+        data = response.json()
+        assert "Todo not found" in data["detail"]
+    
+    def test_update_todo_success(self):
+        """Test updating a todo successfully"""
+        todo = self.add_todo_to_storage(self.create_sample_todo())
+        
+        update_data = {
+            "title": "Updated Todo",
+            "description": "Updated Description",
+            "priority": "high"
+        }
+        
+        response = client.put(f"/api/todos/{todo['id']}", json=update_data)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["data"]["title"] == update_data["title"]
+        assert data["data"]["description"] == update_data["description"]
+        assert data["data"]["priority"] == update_data["priority"]
+    
+    def test_update_todo_status(self):
+        """Test updating todo status via PATCH"""
+        todo = self.add_todo_to_storage(self.create_sample_todo())
+        
+        response = client.patch(f"/api/todos/{todo['id']}/status", 
+                               json={"status": "completed"})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["data"]["status"] == "completed"
+    
+    def test_delete_todo_success(self):
+        """Test deleting a todo"""
+        todo = self.add_todo_to_storage(self.create_sample_todo())
+        
+        response = client.delete(f"/api/todos/{todo['id']}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["data"]["id"] == todo["id"]
+        
+        # Verify it's actually deleted
+        assert find_todo_by_id(todo['id']) is None
+    
+    def test_delete_all_todos(self):
+        """Test deleting all todos"""
+        # Add multiple todos
+        for i in range(3):
+            self.add_todo_to_storage(self.create_sample_todo(f"Todo {i}"))
+        
+        response = client.delete("/api/todos")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert "Deleted 3 todos" in data["message"]
+        assert len(todos) == 0
+
+class TestValidation(TestSetup):
+    """Test input validation and error handling"""
+    
+    def test_create_todo_missing_title(self):
+        """Test creating todo without title"""
+        todo_data = {"description": "Test"}
+        response = client.post("/api/todos", json=todo_data)
+        assert response.status_code == 422
+    
+    def test_create_todo_empty_title(self):
+        """Test creating todo with empty title"""
+        todo_data = {"title": "   ", "description": "Test"}
+        response = client.post("/api/todos", json=todo_data)
+        assert response.status_code == 422
+    
+    def test_create_todo_title_too_long(self):
+        """Test creating todo with title too long"""
+        todo_data = {"title": "x" * 201, "description": "Test"}
+        response = client.post("/api/todos", json=todo_data)
+        assert response.status_code == 422
+    
+    def test_create_todo_description_too_long(self):
+        """Test creating todo with description too long"""
+        todo_data = {"title": "Test", "description": "x" * 1001}
+        response = client.post("/api/todos", json=todo_data)
+        assert response.status_code == 422
+    
+    def test_create_todo_invalid_priority(self):
+        """Test creating todo with invalid priority"""
+        todo_data = {"title": "Test", "priority": "urgent"}
+        response = client.post("/api/todos", json=todo_data)
+        assert response.status_code == 422
+    
+    def test_create_duplicate_title(self):
+        """Test creating todo with duplicate title"""
+        todo_data = self.create_sample_todo("Duplicate Title")
+        
+        # Create first todo
+        response1 = client.post("/api/todos", json=todo_data)
+        assert response1.status_code == 201
+        
+        # Try to create duplicate
+        response2 = client.post("/api/todos", json=todo_data)
+        assert response2.status_code == 400
+        assert "already exists" in response2.json()["detail"]
+    
+    def test_update_todo_invalid_status(self):
+        """Test updating todo with invalid status"""
+        todo = self.add_todo_to_storage(self.create_sample_todo())
+        
+        response = client.patch(f"/api/todos/{todo['id']}/status", 
+                               json={"status": "invalid"})
+        assert response.status_code == 422
+    
+    def test_invalid_due_date_format(self):
+        """Test creating todo with invalid due date format"""
+        todo_data = {
+            "title": "Test Todo",
+            "due_date": "invalid-date"
+        }
+        response = client.post("/api/todos", json=todo_data)
+        assert response.status_code == 422
+
+class TestFiltering(TestSetup):
+    """Test filtering and search functionality"""
+    
+    def setup_test_data(self):
+        """Setup test data for filtering tests"""
+        test_todos = [
+            {"title": "Buy groceries", "priority": "high", "description": "Milk and bread"},
+            {"title": "Walk the dog", "priority": "medium", "description": "30 minutes in park"},
+            {"title": "Finish report", "priority": "high", "description": "Quarterly sales report"},
+            {"title": "Call mom", "priority": "low", "description": "Weekly check-in"}
+        ]
+        
+        created_todos = []
+        for todo_data in test_todos:
+            todo = self.add_todo_to_storage(todo_data)
+            created_todos.append(todo)
+        
+        # Mark some as completed
+        created_todos[0]["status"] = "completed"
+        created_todos[2]["status"] = "completed"
+        
+        return created_todos
+    
+    def test_filter_by_status(self):
+        """Test filtering todos by status"""
+        self.setup_test_data()
+        
+        # Test pending filter
+        response = client.get("/api/todos?status=pending")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 2
+        for todo in data["data"]:
+            assert todo["status"] == "pending"
+        
+        # Test completed filter
+        response = client.get("/api/todos?status=completed")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 2
+        for todo in data["data"]:
+            assert todo["status"] == "completed"
+    
+    def test_filter_by_priority(self):
+        """Test filtering todos by priority"""
+        self.setup_test_data()
+        
+        response = client.get("/api/todos?priority=high")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 2
+        for todo in data["data"]:
+            assert todo["priority"] == "high"
+    
+    def test_search_functionality(self):
+        """Test search in title and description"""
+        self.setup_test_data()
+        
+        # Search in title
+        response = client.get("/api/todos?search=groceries")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 1
+        assert "groceries" in data["data"][0]["title"].lower()
+        
+        # Search in description
+        response = client.get("/api/todos?search=report")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 1
+        assert "report" in data["data"][0]["description"].lower()
+    
+    def test_combined_filters(self):
+        """Test combining multiple filters"""
+        self.setup_test_data()
+        
+        response = client.get("/api/todos?status=pending&priority=medium")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 1
+        todo = data["data"][0]
+        assert todo["status"] == "pending"
+        assert todo["priority"] == "medium"
+    
+    def test_pagination(self):
+        """Test pagination with limit and offset"""
+        self.setup_test_data()
+        
+        # Test limit
+        response = client.get("/api/todos?limit=2")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["data"]) == 2
+        assert data["count"] == 4  # Total count
+        
+        # Test offset
+        response = client.get("/api/todos?limit=2&offset=2")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["data"]) == 2
+
+class TestEdgeCases(TestSetup):
+    """Test edge cases and error scenarios"""
+    
+    def test_whitespace_handling(self):
+        """Test handling of whitespace in inputs"""
+        todo_data = {
+            "title": "  Whitespace Todo  ",
+            "description": "  Description with spaces  "
+        }
+        
+        response = client.post("/api/todos", json=todo_data)
+        assert response.status_code == 201
+        data = response.json()
+        assert data["data"]["title"] == "Whitespace Todo"
+        assert data["data"]["description"] == "Description with spaces"
+    
+    def test_unicode_handling(self):
+        """Test handling of unicode characters"""
+        todo_data = {
+            "title": "📋 Unicode Todo 中文",
+            "description": "Description with émojis 🚀 and spëcial chars"
+        }
+        
+        response = client.post("/api/todos", json=todo_data)
+        assert response.status_code == 201
+        data = response.json()
+        assert data["data"]["title"] == todo_data["title"]
+        assert data["data"]["description"] == todo_data["description"]
+    
+    def test_large_number_of_todos(self):
+        """Test performance with large number of todos"""
+        # Create 100 todos
+        for i in range(100):
+            self.add_todo_to_storage(self.create_sample_todo(f"Todo {i:03d}"))
+        
+        response = client.get("/api/todos")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 100
+        assert len(data["data"]) == 100
+    
+    def test_malformed_json(self):
+        """Test handling of malformed JSON"""
+        response = client.post("/api/todos", 
+                              data="invalid json",
+                              headers={"Content-Type": "application/json"})
+        assert response.status_code == 422
+    
+    def test_empty_json(self):
+        """Test handling of empty JSON"""
+        response = client.post("/api/todos", json={})
+        assert response.status_code == 422
+    
+    def test_sql_injection_attempt(self):
+        """Test protection against SQL injection (though we're using in-memory)"""
+        malicious_data = {
+            "title": "'; DROP TABLE todos; --",
+            "description": "SELECT * FROM users WHERE 1=1"
+        }
+        
+        response = client.post("/api/todos", json=malicious_data)
+        assert response.status_code == 201  # Should create successfully
+        # App should handle this safely since we're not using SQL
+
+class TestStatistics(TestSetup):
+    """Test statistics endpoint"""
+    
+    def test_empty_stats(self):
+        """Test statistics with no todos"""
+        response = client.get("/api/stats")
+        assert response.status_code == 200
+        data = response.json()
+        stats = data["data"]
+        assert stats["total_todos"] == 0
+        assert stats["completed"] == 0
+        assert stats["pending"] == 0
+        assert stats["overdue"] == 0
+    
+    def test_stats_with_data(self):
+        """Test statistics with various todos"""
+        # Create test data
+        test_todos = [
+            {"title": "Todo 1", "priority": "high"},
+            {"title": "Todo 2", "priority": "medium"},
+            {"title": "Todo 3", "priority": "low"},
+            {"title": "Todo 4", "priority": "high"}
+        ]
+        
+        created_todos = []
+        for todo_data in test_todos:
+            todo = self.add_todo_to_storage(todo_data)
+            created_todos.append(todo)
+        
+        # Mark some as completed
+        created_todos[0]["status"] = "completed"
+        created_todos[1]["status"] = "completed"
+        
+        response = client.get("/api/stats")
+        assert response.status_code == 200
+        data = response.json()
+        stats = data["data"]
+        
+        assert stats["total_todos"] == 4
+        assert stats["completed"] == 2
+        assert stats["pending"] == 2
+        assert stats["priority_breakdown"]["high"] == 2
+        assert stats["priority_breakdown"]["medium"] == 1
+        assert stats["priority_breakdown"]["low"] == 1
+
+class TestPerformance(TestSetup):
+    """Test performance characteristics"""
+    
+    def test_response_time_single_request(self):
+        """Test response time for single request"""
+        start_time = time.time()
+        response = client.get("/api/todos")
+        end_time = time.time()
+        
+        assert response.status_code == 200
+        response_time = end_time - start_time
+        assert response_time < 1.0  # Should respond within 1 second
+    
+    def test_concurrent_requests(self):
+        """Test handling of concurrent requests"""
+        def make_request(i):
+            todo_data = self.create_sample_todo(f"Concurrent Todo {i}")
+            response = client.post("/api/todos", json=todo_data)
+            return response.status_code == 201
+        
+        # Make 10 concurrent requests
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(make_request, i) for i in range(10)]
+            results = [future.result() for future in as_completed(futures)]
+        
+        # All requests should succeed
+        assert all(results)
+        assert len(todos) == 10
+    
+    def test_memory_usage_with_large_dataset(self):
+        """Test memory usage with large dataset"""
+        import psutil
+        import os
+        
+        process = psutil.Process(os.getpid())
+        initial_memory = process.memory_info().rss
+        
+        # Create 1000 todos
+        for i in range(1000):
+            self.add_todo_to_storage(self.create_sample_todo(f"Todo {i}"))
+        
+        final_memory = process.memory_info().rss
+        memory_increase = final_memory - initial_memory
+        
+        # Memory increase should be reasonable (less than 100MB)
+        assert memory_increase < 100 * 1024 * 1024  # 100MB
+    
+    def test_search_performance(self):
+        """Test search performance with large dataset"""
+        # Create 1000 todos
+        for i in range(1000):
+            self.add_todo_to_storage(self.create_sample_todo(f"Performance Todo {i}"))
+        
+        start_time = time.time()
+        response = client.get("/api/todos?search=500")
+        end_time = time.time()
+        
+        assert response.status_code == 200
+        search_time = end_time - start_time
+        assert search_time < 2.0  # Search should complete within 2 seconds
+
+class TestIntegration(TestSetup):
+    """Integration tests for complete workflows"""
+    
+    def test_complete_todo_lifecycle(self):
+        """Test complete CRUD lifecycle of a todo"""
+        # Create
+        todo_data = self.create_sample_todo("Lifecycle Todo")
+        response = client.post("/api/todos", json=todo_data)
+        assert response.status_code == 201
+        todo_id = response.json()["data"]["id"]
+        
+        # Read
+        response = client.get(f"/api/todos/{todo_id}")
+        assert response.status_code == 200
+        assert response.json()["data"]["status"] == "pending"
+        
+        # Update
+        update_data = {"title": "Updated Lifecycle Todo"}
+        response = client.put(f"/api/todos/{todo_id}", json=update_data)
+        assert response.status_code == 200
+        assert response.json()["data"]["title"] == update_data["title"]
+        
+        # Update status
+        response = client.patch(f"/api/todos/{todo_id}/status",
