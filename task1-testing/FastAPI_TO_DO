@@ -1,0 +1,279 @@
+# main.py - FastAPI Todo Application
+from fastapi import FastAPI, HTTPException, Query, status
+from pydantic import BaseModel, Field, validator
+from typing import Optional, List, Dict, Any
+from datetime import datetime, timezone
+from enum import Enum
+import uuid
+
+app = FastAPI(
+    title="Todo API",
+    description="A simple Todo API with FastAPI",
+    version="1.0.0"
+)
+
+# Enums
+class TodoStatus(str, Enum):
+    pending = "pending"
+    completed = "completed"
+
+class Priority(str, Enum):
+    low = "low"
+    medium = "medium"
+    high = "high"
+
+# Pydantic Models
+class TodoCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200, description="Todo title")
+    description: Optional[str] = Field(None, max_length=1000, description="Todo description")
+    priority: Priority = Field(Priority.medium, description="Todo priority")
+    due_date: Optional[datetime] = Field(None, description="Due date in ISO format")
+
+    @validator('title')
+    def title_must_not_be_empty(cls, v):
+        if not v.strip():
+            raise ValueError('Title cannot be empty or whitespace only')
+        return v.strip()
+
+    @validator('description')
+    def description_validator(cls, v):
+        if v is not None:
+            return v.strip() if v.strip() else None
+        return v
+
+class TodoUpdate(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=200)
+    description: Optional[str] = Field(None, max_length=1000)
+    priority: Optional[Priority] = None
+    due_date: Optional[datetime] = None
+
+    @validator('title')
+    def title_must_not_be_empty(cls, v):
+        if v is not None and not v.strip():
+            raise ValueError('Title cannot be empty or whitespace only')
+        return v.strip() if v else v
+
+    @validator('description')
+    def description_validator(cls, v):
+        if v is not None:
+            return v.strip() if v.strip() else None
+        return v
+
+class TodoStatusUpdate(BaseModel):
+    status: TodoStatus
+
+class TodoResponse(BaseModel):
+    id: str
+    title: str
+    description: Optional[str]
+    status: TodoStatus
+    priority: Priority
+    due_date: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class TodoListResponse(BaseModel):
+    success: bool = True
+    data: List[TodoResponse]
+    count: int
+
+class SingleTodoResponse(BaseModel):
+    success: bool = True
+    data: TodoResponse
+
+class MessageResponse(BaseModel):
+    success: bool
+    message: str
+
+# In-memory storage
+todos: List[Dict[str, Any]] = []
+
+# Helper functions
+def find_todo_by_id(todo_id: str) -> Optional[Dict[str, Any]]:
+    return next((todo for todo in todos if todo["id"] == todo_id), None)
+
+def create_todo_dict(todo_data: TodoCreate) -> Dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    return {
+        "id": str(uuid.uuid4()),
+        "title": todo_data.title,
+        "description": todo_data.description,
+        "status": TodoStatus.pending,
+        "priority": todo_data.priority,
+        "due_date": todo_data.due_date,
+        "created_at": now,
+        "updated_at": now
+    }
+
+# Routes
+@app.get("/", response_model=MessageResponse)
+async def root():
+    return MessageResponse(success=True, message="Todo API is running!")
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "version": "1.0.0"
+    }
+
+@app.get("/api/todos", response_model=TodoListResponse)
+async def get_todos(
+    status: Optional[TodoStatus] = Query(None, description="Filter by status"),
+    priority: Optional[Priority] = Query(None, description="Filter by priority"),
+    search: Optional[str] = Query(None, min_length=1, description="Search in title and description"),
+    limit: Optional[int] = Query(None, ge=1, le=100, description="Limit number of results"),
+    offset: Optional[int] = Query(0, ge=0, description="Offset for pagination")
+):
+    filtered_todos = todos.copy()
+    
+    # Apply filters
+    if status:
+        filtered_todos = [todo for todo in filtered_todos if todo["status"] == status]
+    
+    if priority:
+        filtered_todos = [todo for todo in filtered_todos if todo["priority"] == priority]
+    
+    if search:
+        search_lower = search.lower()
+        filtered_todos = [
+            todo for todo in filtered_todos 
+            if search_lower in todo["title"].lower() or 
+            (todo["description"] and search_lower in todo["description"].lower())
+        ]
+    
+    # Apply pagination
+    total_count = len(filtered_todos)
+    if limit:
+        filtered_todos = filtered_todos[offset:offset + limit]
+    else:
+        filtered_todos = filtered_todos[offset:]
+    
+    return TodoListResponse(
+        data=[TodoResponse(**todo) for todo in filtered_todos],
+        count=total_count
+    )
+
+@app.get("/api/todos/{todo_id}", response_model=SingleTodoResponse)
+async def get_todo(todo_id: str):
+    todo = find_todo_by_id(todo_id)
+    if not todo:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Todo not found"
+        )
+    
+    return SingleTodoResponse(data=TodoResponse(**todo))
+
+@app.post("/api/todos", response_model=SingleTodoResponse, status_code=status.HTTP_201_CREATED)
+async def create_todo(todo: TodoCreate):
+    # Check for duplicate titles
+    if any(existing_todo["title"] == todo.title for existing_todo in todos):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Todo with this title already exists"
+        )
+    
+    new_todo = create_todo_dict(todo)
+    todos.append(new_todo)
+    
+    return SingleTodoResponse(data=TodoResponse(**new_todo))
+
+@app.put("/api/todos/{todo_id}", response_model=SingleTodoResponse)
+async def update_todo(todo_id: str, todo_update: TodoUpdate):
+    todo = find_todo_by_id(todo_id)
+    if not todo:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Todo not found"
+        )
+    
+    # Check for duplicate titles if title is being updated
+    if todo_update.title and todo_update.title != todo["title"]:
+        if any(existing_todo["title"] == todo_update.title for existing_todo in todos if existing_todo["id"] != todo_id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Todo with this title already exists"
+            )
+    
+    # Update fields
+    update_data = todo_update.dict(exclude_unset=True)
+    for field, value in update_data.items():
+        todo[field] = value
+    
+    todo["updated_at"] = datetime.now(timezone.utc)
+    
+    return SingleTodoResponse(data=TodoResponse(**todo))
+
+@app.patch("/api/todos/{todo_id}/status", response_model=SingleTodoResponse)
+async def update_todo_status(todo_id: str, status_update: TodoStatusUpdate):
+    todo = find_todo_by_id(todo_id)
+    if not todo:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Todo not found"
+        )
+    
+    todo["status"] = status_update.status
+    todo["updated_at"] = datetime.now(timezone.utc)
+    
+    return SingleTodoResponse(data=TodoResponse(**todo))
+
+@app.delete("/api/todos/{todo_id}", response_model=SingleTodoResponse)
+async def delete_todo(todo_id: str):
+    todo = find_todo_by_id(todo_id)
+    if not todo:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Todo not found"
+        )
+    
+    todos.remove(todo)
+    return SingleTodoResponse(data=TodoResponse(**todo))
+
+@app.delete("/api/todos", response_model=MessageResponse)
+async def delete_all_todos():
+    count = len(todos)
+    todos.clear()
+    return MessageResponse(
+        success=True,
+        message=f"Deleted {count} todos"
+    )
+
+# Statistics endpoint
+@app.get("/api/stats")
+async def get_statistics():
+    total = len(todos)
+    completed = len([todo for todo in todos if todo["status"] == TodoStatus.completed])
+    pending = total - completed
+    
+    priority_stats = {
+        "low": len([todo for todo in todos if todo["priority"] == Priority.low]),
+        "medium": len([todo for todo in todos if todo["priority"] == Priority.medium]),
+        "high": len([todo for todo in todos if todo["priority"] == Priority.high])
+    }
+    
+    overdue_count = 0
+    now = datetime.now(timezone.utc)
+    for todo in todos:
+        if todo["due_date"] and todo["due_date"] < now and todo["status"] == TodoStatus.pending:
+            overdue_count += 1
+    
+    return {
+        "success": True,
+        "data": {
+            "total_todos": total,
+            "completed": completed,
+            "pending": pending,
+            "overdue": overdue_count,
+            "priority_breakdown": priority_stats
+        }
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
