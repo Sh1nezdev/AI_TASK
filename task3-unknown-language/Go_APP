@@ -1,0 +1,697 @@
+// main.go - HTTP сервер Todo API на Go
+package main
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/gorilla/mux"
+	_ "github.com/mattn/go-sqlite3"
+)
+
+// Todo структура для представления задачи
+type Todo struct {
+	ID          string    `json:"id" db:"id"`
+	Title       string    `json:"title" db:"title"`
+	Description string    `json:"description" db:"description"`
+	Status      string    `json:"status" db:"status"`
+	Priority    string    `json:"priority" db:"priority"`
+	CreatedAt   time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at" db:"updated_at"`
+}
+
+// CreateTodoRequest структура для создания задачи
+type CreateTodoRequest struct {
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Priority    string `json:"priority"`
+}
+
+// UpdateTodoRequest структура для обновления задачи
+type UpdateTodoRequest struct {
+	Title       *string `json:"title,omitempty"`
+	Description *string `json:"description,omitempty"`
+	Priority    *string `json:"priority,omitempty"`
+	Status      *string `json:"status,omitempty"`
+}
+
+// APIResponse общая структура ответа API
+type APIResponse struct {
+	Success bool        `json:"success"`
+	Data    interface{} `json:"data,omitempty"`
+	Message string      `json:"message,omitempty"`
+	Error   string      `json:"error,omitempty"`
+}
+
+// TodoListResponse структура для списка задач
+type TodoListResponse struct {
+	Success bool   `json:"success"`
+	Data    []Todo `json:"data"`
+	Count   int    `json:"count"`
+}
+
+// StatsResponse структура для статистики
+type StatsResponse struct {
+	Success bool `json:"success"`
+	Data    struct {
+		Total     int `json:"total"`
+		Pending   int `json:"pending"`
+		Completed int `json:"completed"`
+		ByPriority struct {
+			Low    int `json:"low"`
+			Medium int `json:"medium"`
+			High   int `json:"high"`
+		} `json:"by_priority"`
+	} `json:"data"`
+}
+
+// Server структура сервера
+type Server struct {
+	db *sql.DB
+}
+
+// NewServer создает новый экземпляр сервера
+func NewServer(db *sql.DB) *Server {
+	return &Server{db: db}
+}
+
+// Инициализация базы данных
+func initDB(dbPath string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка открытия базы данных: %v", err)
+	}
+
+	// Создание таблицы todos
+	createTableSQL := `
+	CREATE TABLE IF NOT EXISTS todos (
+		id TEXT PRIMARY KEY,
+		title TEXT NOT NULL,
+		description TEXT DEFAULT '',
+		status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'completed')),
+		priority TEXT DEFAULT 'medium' CHECK (priority IN ('low', 'medium', 'high')),
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	
+	CREATE INDEX IF NOT EXISTS idx_status ON todos(status);
+	CREATE INDEX IF NOT EXISTS idx_priority ON todos(priority);
+	CREATE INDEX IF NOT EXISTS idx_created_at ON todos(created_at);
+	`
+
+	if _, err := db.Exec(createTableSQL); err != nil {
+		return nil, fmt.Errorf("ошибка создания таблицы: %v", err)
+	}
+
+	return db, nil
+}
+
+// Валидация входных данных
+func validateCreateTodo(req *CreateTodoRequest) error {
+	if strings.TrimSpace(req.Title) == "" {
+		return fmt.Errorf("название задачи обязательно")
+	}
+	if len(req.Title) > 200 {
+		return fmt.Errorf("название задачи не может превышать 200 символов")
+	}
+	if len(req.Description) > 1000 {
+		return fmt.Errorf("описание не может превышать 1000 символов")
+	}
+	if req.Priority != "" && !isValidPriority(req.Priority) {
+		return fmt.Errorf("приоритет должен быть: low, medium, high")
+	}
+	return nil
+}
+
+// Проверка валидности приоритета
+func isValidPriority(priority string) bool {
+	return priority == "low" || priority == "medium" || priority == "high"
+}
+
+// Проверка валидности статуса
+func isValidStatus(status string) bool {
+	return status == "pending" || status == "completed"
+}
+
+// Отправка JSON ответа
+func sendJSONResponse(w http.ResponseWriter, statusCode int, response interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(response)
+}
+
+// Отправка ошибки
+func sendError(w http.ResponseWriter, statusCode int, message string) {
+	response := APIResponse{
+		Success: false,
+		Error:   message,
+	}
+	sendJSONResponse(w, statusCode, response)
+}
+
+// CORS middleware
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		// Обработка preflight запросов
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// Логирование middleware
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		log.Printf("Начало запроса: %s %s", r.Method, r.URL.Path)
+		
+		next.ServeHTTP(w, r)
+		
+		duration := time.Since(start)
+		log.Printf("Завершение запроса: %s %s (продолжительность: %v)", r.Method, r.URL.Path, duration)
+	})
+}
+
+// Получение всех задач с фильтрацией
+func (s *Server) getTodos(w http.ResponseWriter, r *http.Request) {
+	// Получение параметров запроса
+	query := r.URL.Query()
+	status := query.Get("status")
+	priority := query.Get("priority")
+	search := query.Get("search")
+	limitStr := query.Get("limit")
+	offsetStr := query.Get("offset")
+
+	// Построение SQL запроса
+	sqlQuery := "SELECT id, title, description, status, priority, created_at, updated_at FROM todos WHERE 1=1"
+	args := []interface{}{}
+
+	// Добавление фильтров
+	if status != "" {
+		if !isValidStatus(status) {
+			sendError(w, http.StatusBadRequest, "Неверный статус")
+			return
+		}
+		sqlQuery += " AND status = ?"
+		args = append(args, status)
+	}
+
+	if priority != "" {
+		if !isValidPriority(priority) {
+			sendError(w, http.StatusBadRequest, "Неверный приоритет")
+			return
+		}
+		sqlQuery += " AND priority = ?"
+		args = append(args, priority)
+	}
+
+	if search != "" {
+		sqlQuery += " AND (title LIKE ? OR description LIKE ?)"
+		searchTerm := "%" + search + "%"
+		args = append(args, searchTerm, searchTerm)
+	}
+
+	// Подсчет общего количества
+	countQuery := strings.Replace(sqlQuery, "SELECT id, title, description, status, priority, created_at, updated_at FROM todos", "SELECT COUNT(*) FROM todos", 1)
+	var totalCount int
+	err := s.db.QueryRow(countQuery, args...).Scan(&totalCount)
+	if err != nil {
+		sendError(w, http.StatusInternalServerError, "Ошибка подсчета записей")
+		return
+	}
+
+	// Добавление сортировки
+	sqlQuery += " ORDER BY created_at DESC"
+
+	// Добавление пагинации
+	if limitStr != "" {
+		limit, err := strconv.Atoi(limitStr)
+		if err != nil || limit <= 0 || limit > 100 {
+			sendError(w, http.StatusBadRequest, "Неверный параметр limit (должен быть 1-100)")
+			return
+		}
+		sqlQuery += " LIMIT ?"
+		args = append(args, limit)
+
+		if offsetStr != "" {
+			offset, err := strconv.Atoi(offsetStr)
+			if err != nil || offset < 0 {
+				sendError(w, http.StatusBadRequest, "Неверный параметр offset")
+				return
+			}
+			sqlQuery += " OFFSET ?"
+			args = append(args, offset)
+		}
+	}
+
+	// Выполнение запроса
+	rows, err := s.db.Query(sqlQuery, args...)
+	if err != nil {
+		sendError(w, http.StatusInternalServerError, "Ошибка выполнения запроса")
+		return
+	}
+	defer rows.Close()
+
+	// Сканирование результатов
+	var todos []Todo
+	for rows.Next() {
+		var todo Todo
+		err := rows.Scan(&todo.ID, &todo.Title, &todo.Description, &todo.Status, &todo.Priority, &todo.CreatedAt, &todo.UpdatedAt)
+		if err != nil {
+			sendError(w, http.StatusInternalServerError, "Ошибка сканирования данных")
+			return
+		}
+		todos = append(todos, todo)
+	}
+
+	response := TodoListResponse{
+		Success: true,
+		Data:    todos,
+		Count:   totalCount,
+	}
+
+	sendJSONResponse(w, http.StatusOK, response)
+}
+
+// Получение задачи по ID
+func (s *Server) getTodoByID(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	if id == "" {
+		sendError(w, http.StatusBadRequest, "ID задачи обязателен")
+		return
+	}
+
+	var todo Todo
+	query := "SELECT id, title, description, status, priority, created_at, updated_at FROM todos WHERE id = ?"
+	err := s.db.QueryRow(query, id).Scan(&todo.ID, &todo.Title, &todo.Description, &todo.Status, &todo.Priority, &todo.CreatedAt, &todo.UpdatedAt)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			sendError(w, http.StatusNotFound, "Задача не найдена")
+			return
+		}
+		sendError(w, http.StatusInternalServerError, "Ошибка получения задачи")
+		return
+	}
+
+	response := APIResponse{
+		Success: true,
+		Data:    todo,
+	}
+
+	sendJSONResponse(w, http.StatusOK, response)
+}
+
+// Создание новой задачи
+func (s *Server) createTodo(w http.ResponseWriter, r *http.Request) {
+	var req CreateTodoRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		sendError(w, http.StatusBadRequest, "Неверный формат JSON")
+		return
+	}
+
+	// Валидация данных
+	if err := validateCreateTodo(&req); err != nil {
+		sendError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Проверка на дублирование названий
+	var exists bool
+	checkQuery := "SELECT EXISTS(SELECT 1 FROM todos WHERE title = ?)"
+	err := s.db.QueryRow(checkQuery, req.Title).Scan(&exists)
+	if err != nil {
+		sendError(w, http.StatusInternalServerError, "Ошибка проверки дубликатов")
+		return
+	}
+
+	if exists {
+		sendError(w, http.StatusBadRequest, "Задача с таким названием уже существует")
+		return
+	}
+
+	// Создание новой задачи
+	todo := Todo{
+		ID:          uuid.New().String(),
+		Title:       strings.TrimSpace(req.Title),
+		Description: strings.TrimSpace(req.Description),
+		Status:      "pending",
+		Priority:    req.Priority,
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+
+	// Установка приоритета по умолчанию
+	if todo.Priority == "" {
+		todo.Priority = "medium"
+	}
+
+	// Вставка в базу данных
+	insertQuery := `INSERT INTO todos (id, title, description, status, priority, created_at, updated_at) 
+					VALUES (?, ?, ?, ?, ?, ?, ?)`
+	
+	_, err = s.db.Exec(insertQuery, todo.ID, todo.Title, todo.Description, todo.Status, todo.Priority, todo.CreatedAt, todo.UpdatedAt)
+	if err != nil {
+		sendError(w, http.StatusInternalServerError, "Ошибка создания задачи")
+		return
+	}
+
+	response := APIResponse{
+		Success: true,
+		Data:    todo,
+	}
+
+	sendJSONResponse(w, http.StatusCreated, response)
+}
+
+// Обновление задачи
+func (s *Server) updateTodo(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	if id == "" {
+		sendError(w, http.StatusBadRequest, "ID задачи обязателен")
+		return
+	}
+
+	var req UpdateTodoRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		sendError(w, http.StatusBadRequest, "Неверный формат JSON")
+		return
+	}
+
+	// Проверка существования задачи
+	var exists bool
+	checkQuery := "SELECT EXISTS(SELECT 1 FROM todos WHERE id = ?)"
+	err := s.db.QueryRow(checkQuery, id).Scan(&exists)
+	if err != nil {
+		sendError(w, http.StatusInternalServerError, "Ошибка проверки существования задачи")
+		return
+	}
+
+	if !exists {
+		sendError(w, http.StatusNotFound, "Задача не найдена")
+		return
+	}
+
+	// Построение динамического запроса обновления
+	setParts := []string{}
+	args := []interface{}{}
+
+	if req.Title != nil {
+		title := strings.TrimSpace(*req.Title)
+		if title == "" {
+			sendError(w, http.StatusBadRequest, "Название задачи не может быть пустым")
+			return
+		}
+		if len(title) > 200 {
+			sendError(w, http.StatusBadRequest, "Название задачи не может превышать 200 символов")
+			return
+		}
+
+		// Проверка на дублирование названий (исключая текущую задачу)
+		var titleExists bool
+		titleCheckQuery := "SELECT EXISTS(SELECT 1 FROM todos WHERE title = ? AND id != ?)"
+		err := s.db.QueryRow(titleCheckQuery, title, id).Scan(&titleExists)
+		if err != nil {
+			sendError(w, http.StatusInternalServerError, "Ошибка проверки дубликатов названий")
+			return
+		}
+
+		if titleExists {
+			sendError(w, http.StatusBadRequest, "Задача с таким названием уже существует")
+			return
+		}
+
+		setParts = append(setParts, "title = ?")
+		args = append(args, title)
+	}
+
+	if req.Description != nil {
+		description := strings.TrimSpace(*req.Description)
+		if len(description) > 1000 {
+			sendError(w, http.StatusBadRequest, "Описание не может превышать 1000 символов")
+			return
+		}
+		setParts = append(setParts, "description = ?")
+		args = append(args, description)
+	}
+
+	if req.Priority != nil {
+		if !isValidPriority(*req.Priority) {
+			sendError(w, http.StatusBadRequest, "Приоритет должен быть: low, medium, high")
+			return
+		}
+		setParts = append(setParts, "priority = ?")
+		args = append(args, *req.Priority)
+	}
+
+	if req.Status != nil {
+		if !isValidStatus(*req.Status) {
+			sendError(w, http.StatusBadRequest, "Статус должен быть: pending, completed")
+			return
+		}
+		setParts = append(setParts, "status = ?")
+		args = append(args, *req.Status)
+	}
+
+	if len(setParts) == 0 {
+		sendError(w, http.StatusBadRequest, "Нет полей для обновления")
+		return
+	}
+
+	// Добавление updated_at
+	setParts = append(setParts, "updated_at = ?")
+	args = append(args, time.Now())
+
+	// Добавление ID для WHERE условия
+	args = append(args, id)
+
+	// Выполнение обновления
+	updateQuery := "UPDATE todos SET " + strings.Join(setParts, ", ") + " WHERE id = ?"
+	_, err = s.db.Exec(updateQuery, args...)
+	if err != nil {
+		sendError(w, http.StatusInternalServerError, "Ошибка обновления задачи")
+		return
+	}
+
+	// Получение обновленной задачи
+	var todo Todo
+	selectQuery := "SELECT id, title, description, status, priority, created_at, updated_at FROM todos WHERE id = ?"
+	err = s.db.QueryRow(selectQuery, id).Scan(&todo.ID, &todo.Title, &todo.Description, &todo.Status, &todo.Priority, &todo.CreatedAt, &todo.UpdatedAt)
+	if err != nil {
+		sendError(w, http.StatusInternalServerError, "Ошибка получения обновленной задачи")
+		return
+	}
+
+	response := APIResponse{
+		Success: true,
+		Data:    todo,
+	}
+
+	sendJSONResponse(w, http.StatusOK, response)
+}
+
+// Удаление задачи
+func (s *Server) deleteTodo(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	if id == "" {
+		sendError(w, http.StatusBadRequest, "ID задачи обязателен")
+		return
+	}
+
+	// Получение задачи перед удалением
+	var todo Todo
+	selectQuery := "SELECT id, title, description, status, priority, created_at, updated_at FROM todos WHERE id = ?"
+	err := s.db.QueryRow(selectQuery, id).Scan(&todo.ID, &todo.Title, &todo.Description, &todo.Status, &todo.Priority, &todo.CreatedAt, &todo.UpdatedAt)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			sendError(w, http.StatusNotFound, "Задача не найдена")
+			return
+		}
+		sendError(w, http.StatusInternalServerError, "Ошибка получения задачи")
+		return
+	}
+
+	// Удаление задачи
+	deleteQuery := "DELETE FROM todos WHERE id = ?"
+	result, err := s.db.Exec(deleteQuery, id)
+	if err != nil {
+		sendError(w, http.StatusInternalServerError, "Ошибка удаления задачи")
+		return
+	}
+
+	// Проверка, была ли удалена строка
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		sendError(w, http.StatusInternalServerError, "Ошибка проверки удаления")
+		return
+	}
+
+	if rowsAffected == 0 {
+		sendError(w, http.StatusNotFound, "Задача не найдена")
+		return
+	}
+
+	response := APIResponse{
+		Success: true,
+		Data:    todo,
+		Message: "Задача успешно удалена",
+	}
+
+	sendJSONResponse(w, http.StatusOK, response)
+}
+
+// Получение статистики
+func (s *Server) getStats(w http.ResponseWriter, r *http.Request) {
+	var stats StatsResponse
+	stats.Success = true
+
+	// Общее количество задач
+	err := s.db.QueryRow("SELECT COUNT(*) FROM todos").Scan(&stats.Data.Total)
+	if err != nil {
+		sendError(w, http.StatusInternalServerError, "Ошибка получения общего количества")
+		return
+	}
+
+	// Количество незавершенных задач
+	err = s.db.QueryRow("SELECT COUNT(*) FROM todos WHERE status = 'pending'").Scan(&stats.Data.Pending)
+	if err != nil {
+		sendError(w, http.StatusInternalServerError, "Ошибка получения количества незавершенных")
+		return
+	}
+
+	// Количество завершенных задач
+	err = s.db.QueryRow("SELECT COUNT(*) FROM todos WHERE status = 'completed'").Scan(&stats.Data.Completed)
+	if err != nil {
+		sendError(w, http.StatusInternalServerError, "Ошибка получения количества завершенных")
+		return
+	}
+
+	// Статистика по приоритетам
+	err = s.db.QueryRow("SELECT COUNT(*) FROM todos WHERE priority = 'low'").Scan(&stats.Data.ByPriority.Low)
+	if err != nil {
+		sendError(w, http.StatusInternalServerError, "Ошибка получения статистики по приоритету 'low'")
+		return
+	}
+
+	err = s.db.QueryRow("SELECT COUNT(*) FROM todos WHERE priority = 'medium'").Scan(&stats.Data.ByPriority.Medium)
+	if err != nil {
+		sendError(w, http.StatusInternalServerError, "Ошибка получения статистики по приоритету 'medium'")
+		return
+	}
+
+	err = s.db.QueryRow("SELECT COUNT(*) FROM todos WHERE priority = 'high'").Scan(&stats.Data.ByPriority.High)
+	if err != nil {
+		sendError(w, http.StatusInternalServerError, "Ошибка получения статистики по приоритету 'high'")
+		return
+	}
+
+	sendJSONResponse(w, http.StatusOK, stats)
+}
+
+// Проверка здоровья приложения
+func (s *Server) healthCheck(w http.ResponseWriter, r *http.Request) {
+	// Проверка подключения к базе данных
+	err := s.db.Ping()
+	if err != nil {
+		response := map[string]interface{}{
+			"status":    "unhealthy",
+			"timestamp": time.Now().Format(time.RFC3339),
+			"error":     "Проблема с подключением к базе данных",
+		}
+		sendJSONResponse(w, http.StatusServiceUnavailable, response)
+		return
+	}
+
+	response := map[string]interface{}{
+		"status":    "healthy",
+		"timestamp": time.Now().Format(time.RFC3339),
+		"version":   "1.0.0",
+		"database":  "connected",
+	}
+
+	sendJSONResponse(w, http.StatusOK, response)
+}
+
+// Корневой обработчик
+func (s *Server) rootHandler(w http.ResponseWriter, r *http.Request) {
+	response := APIResponse{
+		Success: true,
+		Message: "Todo API на Go работает успешно!",
+	}
+	sendJSONResponse(w, http.StatusOK, response)
+}
+
+// Настройка маршрутов
+func (s *Server) setupRoutes() *mux.Router {
+	r := mux.NewRouter()
+
+	// Применение middleware
+	r.Use(corsMiddleware)
+	r.Use(loggingMiddleware)
+
+	// API маршруты
+	api := r.PathPrefix("/api").Subrouter()
+	api.HandleFunc("/todos", s.getTodos).Methods("GET")
+	api.HandleFunc("/todos", s.createTodo).Methods("POST")
+	api.HandleFunc("/todos/{id}", s.getTodoByID).Methods("GET")
+	api.HandleFunc("/todos/{id}", s.updateTodo).Methods("PUT")
+	api.HandleFunc("/todos/{id}", s.deleteTodo).Methods("DELETE")
+	api.HandleFunc("/stats", s.getStats).Methods("GET")
+
+	// Служебные маршруты
+	r.HandleFunc("/", s.rootHandler).Methods("GET")
+	r.HandleFunc("/health", s.healthCheck).Methods("GET")
+
+	return r
+}
+
+func main() {
+	log.Println("Запуск Todo API сервера на Go...")
+
+	// Инициализация базы данных
+	db, err := initDB("todos.db")
+	if err != nil {
+		log.Fatalf("Ошибка инициализации базы данных: %v", err)
+	}
+	defer db.Close()
+
+	log.Println("База данных успешно инициализирована")
+
+	// Создание сервера
+	server := NewServer(db)
+
+	// Настройка маршрутов
+	router := server.setupRoutes()
+
+	// Запуск HTTP сервера
+	port := ":8080"
+	log.Printf("Сервер запущен на порту %s", port)
+	log.Printf("Документация API доступна по адресу: http://localhost%s", port)
+	log.Printf("Проверка здоровья: http://localhost%s/health", port)
+
+	// Запуск сервера с обработкой ошибок
+	if err := http.ListenAndServe(port, router); err != nil {
+		log.Fatalf("Ошибка запуска сервера: %v", err)
+	}
+}
