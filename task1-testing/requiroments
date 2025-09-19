@@ -1,0 +1,159 @@
+# requirements.txt
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+python-multipart==0.0.6
+
+# Test dependencies
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-benchmark==4.0.0
+pytest-cov==4.1.0
+httpx==0.25.2
+psutil==5.9.6
+
+# Development dependencies
+black==23.11.0
+flake8==6.1.0
+mypy==1.7.1
+
+---
+
+# pytest.ini
+[tool:pytest]
+testpaths = tests
+python_files = test_*.py
+python_classes = Test*
+python_functions = test_*
+addopts = 
+    -v 
+    --tb=short
+    --strict-markers
+    --disable-warnings
+    --color=yes
+markers =
+    benchmark: marks tests as benchmark tests
+    slow: marks tests as slow running
+    integration: marks tests as integration tests
+    unit: marks tests as unit tests
+
+---
+
+# conftest.py - Pytest configuration and shared fixtures
+import pytest
+from fastapi.testclient import TestClient
+from main import app, todos
+
+@pytest.fixture
+def client():
+    """Create test client"""
+    return TestClient(app)
+
+@pytest.fixture(autouse=True)
+def clean_todos():
+    """Clean todos before and after each test"""
+    todos.clear()
+    yield
+    todos.clear()
+
+@pytest.fixture
+def sample_todo():
+    """Sample todo data for testing"""
+    return {
+        "title": "Test Todo",
+        "description": "Test Description",
+        "priority": "medium"
+    }
+
+@pytest.fixture
+def multiple_todos():
+    """Multiple todo samples for testing"""
+    return [
+        {"title": "First Todo", "priority": "high", "description": "First task"},
+        {"title": "Second Todo", "priority": "medium", "description": "Second task"},
+        {"title": "Third Todo", "priority": "low", "description": "Third task"},
+    ]
+
+---
+
+# Dockerfile for testing
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+# Run tests
+CMD ["python", "-m", "pytest", "-v", "--cov=main", "--cov-report=html"]
+
+---
+
+# docker-compose.test.yml
+version: '3.8'
+services:
+  test:
+    build: .
+    volumes:
+      - .:/app
+      - ./htmlcov:/app/htmlcov
+    command: python -m pytest -v --cov=main --cov-report=html --cov-report=term
+    environment:
+      - PYTHONPATH=/app
+
+---
+
+# Makefile for test automation
+.PHONY: test test-unit test-integration test-performance test-coverage clean
+
+# Run all tests
+test:
+	python -m pytest tests/ -v
+
+# Run only unit tests
+test-unit:
+	python -m pytest tests/ -v -m "not slow and not integration"
+
+# Run integration tests
+test-integration:
+	python -m pytest tests/ -v -m "integration"
+
+# Run performance/benchmark tests
+test-performance:
+	python -m pytest tests/ -v -m "benchmark"
+
+# Run with coverage
+test-coverage:
+	python -m pytest tests/ -v --cov=main --cov-report=html --cov-report=term-missing
+
+# Clean test artifacts
+clean:
+	rm -rf htmlcov/
+	rm -rf .pytest_cache/
+	rm -rf __pycache__/
+	find . -name "*.pyc" -delete
+	find . -name "*.pyo" -delete
+
+# Install dependencies
+install:
+	pip install -r requirements.txt
+
+# Run linting
+lint:
+	flake8 main.py tests/
+	black --check main.py tests/
+	mypy main.py
+
+# Format code
+format:
+	black main.py tests/
+
+# Run app in development
+dev:
+	uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+# Run tests in Docker
+test-docker:
+	docker-compose -f docker-compose.test.yml up --build --abort-on-container-exit
